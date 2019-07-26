@@ -46,7 +46,7 @@
 
 (defvar *bad-types* #("ValvePackingSentinel_t"))
 
-(defvar *bad-consts* #("k_cchPersonaNameMax"))
+(defvar *bad-consts* #("k_cchPersonaNameMax" "VALVE_BIG_ENDIAN" "X64BITS" "POSIX" "__cdecl"))
 
 (defvar *bad-structs* #("CSteamID" "CGameID" "CSteamAPIContext" "CCallResult"
                         "CCallback" "CCallbackBase" "ValvePackingSentinel_t"))
@@ -75,12 +75,15 @@
 
 (defun strip-hungarian (string)
   (let ((i 0))
-    (loop while (or (lower-case-p (char string i))
-                    (char= (char string i) #\_))
+    (when (prefix-p "m_" string)
+      (setf string (subseq string 2)))
+    (loop while (and (< i (length string))
+                     (or (lower-case-p (char string i))
+                         (char= (char string i) #\_)))
           do (incf i))
-    (if (= i (length string))
-        string
-        (subseq string i))))
+    (if (< i (length string))
+        (subseq string i)
+        string)))
 
 (defun kw (name)
   (intern (string-upcase name) "KEYWORD"))
@@ -126,7 +129,7 @@
   (strip-suffixes name "Result_t" "Response_t" "_t"))
 
 (defun strip-constant-name (name)
-  (strip-prefixes name "k_cch" "k_cwch" "k_c" "k_i"))
+  (strip-prefixes name "k_cch" "k_cwch" "k_cub" "k_cb" "k_c" "k_i" "k_ul" "k_un" "k_u" "k_n" "k_"))
 
 (defun parse-typespec (specstring)
   (let ((parts (split #\Space specstring))
@@ -295,11 +298,32 @@
 
 (defun scan-for-constants (content)
   (let ((results ()))
-    (flet ((add-constant (name value)
-             (push (list :constname name :constval value)
-                   results)))
-      (cl-ppcre:do-register-groups (name value) ("#define ([\\w_]+)\\s+\"([^\"]+?)\"" content)
-        (add-constant name value)))
+    (labels ((add-constant (name value)
+               (push (list :constname name :constval value)
+                     results))
+             (parse-value (value)
+               (cond ((eql #\# (char value 0))
+                      NIL)
+                     ((eql #\" (char value 0))
+                      (subseq value 0 (1- (length value))))
+                     ((string= "UINT64_MAX" value)
+                      (1- (ash 1 64)))
+                     ((string= "((uint16)-1)" value)
+                      (1- (ash 1 16)))
+                     ((prefix-p "0x" value)
+                      (parse-integer value :start 2 :end (nth-value 1 (cl-ppcre:scan "0x[\\da-fA-F]+" value)) :radix 16))
+                     ((cl-ppcre:scan "^\\d+\\.\\d+f?" value)
+                      (parse-number:parse-number value :end (1- (length value))))
+                     ((every #'digit-char-p value)
+                      (parse-integer value))))
+             (maybe-add-constant (name value)
+               (let ((value (parse-value value)))
+                 (when (eql T value) (break))
+                 (when value (add-constant name value)))))
+      (cl-ppcre:do-register-groups (name value) ("#define ([\\w_]+)\\s+([^\\n]+?)(\\r|\\n)" content)
+        (maybe-add-constant name value))
+      (cl-ppcre:do-register-groups (name value) ("const\\s+[\\w\\d]+\\s+(k_[\\w_]+)\\s+=\\s(.*?);" content)
+        (maybe-add-constant name value)))
     results))
 
 (defun scan-all-headers (directory)
@@ -356,12 +380,13 @@
       (fresh-line stream))))
 
 (defun write-low-level-file (forms &key output (if-exists :error))
-  (with-open-file (stream (or output *standard-low-level-file*)
-                          :direction :output
-                          :element-type 'character
-                          :if-exists if-exists)
-    (when stream
-      (format stream "~
+  (let ((file (or output *standard-low-level-file*)))
+    (with-open-file (stream file
+                            :direction :output
+                            :element-type 'character
+                            :if-exists if-exists)
+      (when stream
+        (format stream "~
 #|
  This file is a part of cl-steamworks
  (c) 2019 Shirakumo http://tymoon.eu (shinmera@tymoon.eu)
@@ -372,22 +397,24 @@
        The generation occurs via the machinery from generator.lisp
        You should not edit this file manually.
 |#~%")
-      (write-form `(in-package #:org.shirakumo.fraf.steamworks.cffi) stream)
-      (loop for form in forms
-            do (write-form form stream)))))
+        (write-form `(in-package #:org.shirakumo.fraf.steamworks.cffi) stream)
+        (loop for form in forms
+              do (write-form form stream))
+        file))))
 
 (defun generate (source &key output (if-exists :supersede))
   (let* ((meta (pathname-utils:subdirectory source "public" "steam"))
          (json (make-pathname :name "steam_api" :type "json" :defaults meta)))
-    (write-low-level-file
-     (append
-      (compile-steam-api-spec
-       (merge-steam-api-spec
-        (read-steam-api-spec json)
-        (read-steam-api-spec *extras-file*)
-        (scan-all-headers meta))))
-     :output output
-     :if-exists if-exists)))
+    (cl-steamworks::maybe-compile-low-level
+     (write-low-level-file
+      (append
+       (compile-steam-api-spec
+        (merge-steam-api-spec
+         (read-steam-api-spec json)
+         (read-steam-api-spec *extras-file*)
+         (scan-all-headers meta))))
+      :output output
+      :if-exists if-exists))))
 
 (defun query-directory ()
   (format *query-io* "~&~%Please enter the path to the SteamWorks SDK root directory:~%> ")
@@ -408,13 +435,35 @@
            (let ((dest (merge-pathnames (pathname-utils:to-file file) dest)))
              (alexandria:copy-file file dest))))))
 
+(defun generate-shim (sdk)
+  (let ((source (pathname-utils:subdirectory *this* "shim"))
+        (target (pathname-utils:subdirectory *this* "static"
+                                             #+(and linux x86-64) "linux64"
+                                             #+(and linux x86) "linux32"
+                                             #+darwin "osx32"
+                                             #+(and windows x86-64) "win64"
+                                             #+(and windows x86) "")))
+    (uiop:run-program (list "make"
+                            "-C" (uiop:native-namestring source)
+                            (format NIL "steamworks=~a" (uiop:native-namestring sdk)))
+                      :output T :error-output T)
+    (uiop:copy-file (make-pathname :name "steamworks_shim" :type "so" :defaults source)
+                    (make-pathname :name "steamworks_shim" :defaults target :type
+                                   #+linux "so"
+                                   #+darwin "dylib"
+                                   #+windows "dll"))))
+
 (defun setup (&optional (sdk-directory (query-directory)))
   (when sdk-directory
-    (format *query-io* "~&Copying binaries...")
+    (format *query-io* "~&> Copying binaries...")
     (copy-directory-contents
      (pathname-utils:subdirectory sdk-directory "redistributable_bin")
      (ensure-directories-exist (pathname-utils:subdirectory *this* "static")))
-    (format *query-io* "~&Generating bindings...")
+    (format *query-io* "~&> Generating bindings...")
     (cffi:load-foreign-library 'steam::steamworks)
     (generate sdk-directory)
-    (format *query-io* "~&Done. You can now use cl-steamworks!~%")))
+    (format *query-io* "~&> Generating shim library...")
+    (generate-shim sdk-directory)
+    #+asdf (format *query-io* "~&> Recompiling wrapper library...")
+    #+asdf (asdf:load-system :cl-steamworks :force T)
+    (format *query-io* "~&> Done. You can now use cl-steamworks!~%")))

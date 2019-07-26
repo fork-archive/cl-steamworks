@@ -6,7 +6,7 @@
 
 (asdf:defsystem cl-steamworks-generator
   :version "1.0.0"
-  :license "Artistic"
+  :license "zlib"
   :author "Nicolas Hafner <shinmera@tymoon.eu>"
   :maintainer "Nicolas Hafner <shinmera@tymoon.eu>"
   :description "Generator for the low-level steamworks bindings."
@@ -18,5 +18,6 @@
   :depends-on (:yason
                :cffi
                :pathname-utils
+               :parse-number
                :alexandria
                :cl-ppcre))

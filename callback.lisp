@@ -6,7 +6,50 @@
 
 (in-package #:org.shirakumo.fraf.steamworks)
 
-(defclass %callback (c-managed-object)
+(defvar *global-callbacks* (make-hash-table :test 'eq))
+(defvar *instantiated-callbacks* (make-hash-table :test 'eq))
+
+(defclass global-callback (closure-callback)
+  ((name :initarg :name :reader name)))
+
+(defmethod initialize-instance :after ((callback global-callback) &key name)
+  (setf (gethash name *instantiated-callbacks*) callback))
+
+(defun global-callback (name &optional (errorp T))
+  (or (gethash name *global-callbacks*)
+      (when errorp (error 'no-such-callback :callback-name name))))
+
+(defun (setf global-callback) (callback name)
+  (check-type name symbol)
+  (check-type callback (cons symbol (cons function null)))
+  (when (gethash name *instantiated-callbacks*)
+    (free (gethash name *instantiated-callbacks*)))
+  (setf (gethash name *global-callbacks*) callback)
+  (when *steamworks*
+    (make-instance 'global-callback :name name :struct-type (first callback) :closure (second callback))))
+
+(defun remove-global-callback (name)
+  (remhash name *global-callbacks*)
+  (when (gethash name *instantiated-callbacks*)
+    (free (gethash name *instantiated-callbacks*))
+    (remhash name *instantiated-callbacks*)))
+
+(defmacro define-callback (struct-type (result &rest slots) &body body)
+  (destructuring-bind (name type) (enlist struct-type struct-type)
+    `(flet ((callback-thunk (,result)
+              (let ,(loop for slot in slots
+                          collect (destructuring-bind (var name) (enlist slot slot)
+                                    (list var `(,(intern (format NIL "~a-~a" type name) '#:steam) ,result))))
+                ,@body)))
+       (setf (global-callback ',name)
+             (list ',type #'callback-thunk)))))
+
+(defun create-global-callbacks ()
+  (loop for name being the hash-keys of *global-callbacks*
+        for (struct-type thunk) being the hash-values of *global-callbacks*
+        do (make-instance 'global-callback :name name :struct-type struct-type :closure thunk)))
+
+(defclass %callback (c-registered-object c-managed-object)
   ((struct-type :initarg :struct-type :accessor struct-type)))
 
 (defmethod initialize-instance :before ((callback %callback) &key struct-type)
@@ -101,7 +144,9 @@
       (if (steam::utils-get-apicall-result
            utils token result (cffi:foreign-type-size result-type) (callback-type-id (struct-type callresult)) failed)
           (cffi:mem-ref result result-type)
-          (error "FIXME: call failed: ~a" (steam::utils-get-apicall-failure-reason utils token))))))
+          (error 'api-call-failed
+                 :api-call (struct-type callresult)
+                 :error-code (steam::utils-get-apicall-failure-reason utils token))))))
 
 (cffi:defcallback result :void ((this :pointer) (parameter :pointer) (failed :bool))
   (let ((callback (pointer->object this)))
@@ -116,6 +161,18 @@
   (declare (ignore api-call))
   (unwind-protect (funcall (closure callresult) (if failed NIL parameter))
     (free callresult)))
+
+(defun poll-for-result (type handle &key (pause 0.1))
+  (let ((instance (make-instance 'closure-callresult
+                                 :token handle
+                                 :struct-type type
+                                 :closure (constantly NIL))))
+    (unwind-protect
+         (loop for result = (maybe-result instance)
+               do (if result
+                      (return result)
+                      (sleep pause)))
+      (free instance))))
 
 (defmacro with-call-result ((result &key poll) (method interface &rest args) &body body &environment env)
   ;; KLUDGE: in order to infer the struct-type we need access to the method name
@@ -136,12 +193,13 @@
                                        :register ,(null poll)))
              (,interval (let ((,interval ,poll))
                           (etypecase ,interval
-                            
-                            ((eql T) 0.01)
-                            (integer ,interval)))))
+                            ((eql T) 0.1)
+                            (real ,interval)))))
          (if ,interval
-             (loop for ,result = (maybe-result ,instance)
-                   do (if ,result
-                          (,thunk ,result)
-                          (sleep ,interval)))
+             (unwind-protect
+                  (loop for ,result = (maybe-result ,instance)
+                        do (if ,result
+                               (return (,thunk ,result))
+                               (sleep ,interval)))
+               (free ,instance))
              ,instance)))))

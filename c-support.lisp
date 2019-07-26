@@ -18,13 +18,31 @@
 
 (defun callback-type-id (callback)
   (or (gethash callback steam::*callback-id-map*)
-      (error "Not a callback: ~s" callback)))
+      (if *low-level-present*
+          (error "Not a callback: ~s" callback)
+          0)))
+
+(define-compiler-macro callback-type-id (&whole whole callback &environment env)
+  (if (constantp callback env)
+      `(load-time-value (or (gethash ,callback steam::*callback-id-map*)
+                            (if *low-level-present*
+                                (error "Not a callback: ~s" ,callback)
+                                0)))
+      whole))
 
 (defun function-callresult (function)
   (or (gethash function steam::*function-callresult-map*)
-      (error "Not a callresult function: ~s" function)))
+      (if *low-level-present*
+          (error "Not a callresult function: ~s" function)
+          NIL)))
 
-;; TODO: optimise above access through compiler-macros
+(define-compiler-macro function-callresult (&whole whole function &environment env)
+  (if (constantp function env)
+      `(load-time-value (or (gethash ,function steam::*function-callresult-map*)
+                            (if *low-level-present*
+                                (error "Not a callresult function: ~s" ,function)
+                                NIL)))
+      whole))
 
 (defun c-slot-value-extractor (struct slotdef)
   (destructuring-bind (name type &key count offset) slotdef
@@ -77,7 +95,44 @@
    "steam_api.dll"
    :search-path #.(merge-pathnames "win64/" *static*)))
 
+(cffi:define-foreign-library steam::steamworks-shim
+  ((:and :darwin :x86)
+   "steamworks_shim.dylib"
+   :search-path #.(merge-pathnames "osx32/" *static*))
+  ((:and :unix :x86)
+   "steamworks_shim.so"
+   :search-path #.(merge-pathnames "linux32/" *static*))
+  ((:and :unix :x86-64)
+   "steamworks_shim.so"
+   :search-path #.(merge-pathnames "linux64/" *static*))
+  ((:and :windows :x86)
+   "steamworks_shim.dll"
+   :search-path #.(merge-pathnames "/" *static*))
+  ((:and :windows :x86-64)
+   "steamworks_shim.dll"
+   :search-path #.(merge-pathnames "win64/" *static*)))
+
+(cffi:defctype steam::steam-id :unsigned-long)
+
+(defvar *low-level-present* NIL)
+
 (defun maybe-load-low-level (&optional file)
+  (let ((file (or file (make-pathname :name "low-level" :type "lisp" :defaults *this*))))
+    (when (probe-file file)
+      (cffi:load-foreign-library 'steam::steamworks)
+      (cffi:load-foreign-library 'steam::steamworks-shim)
+      (let ((fasl #-asdf (compile-file-pathname file)
+                  #+asdf (asdf:output-file (asdf:find-operation NIL 'asdf:compile-op)
+                                           (make-instance 'asdf:cl-source-file
+                                                          :parent (asdf:find-system :cl-steamworks)
+                                                          :name "low-level"
+                                                          :pathname file))))
+        (if (probe-file fasl)
+            (load fasl :verbose NIL :print NIL)
+            (load file :verbose NIL :print NIL)))
+      (setf *low-level-present* T))))
+
+(defun maybe-compile-low-level (&optional file)
   (let ((file (or file (make-pathname :name "low-level" :type "lisp" :defaults *this*))))
     (when (probe-file file)
       (cffi:load-foreign-library 'steam::steamworks)
@@ -86,17 +141,11 @@
                                       :parent (asdf:find-system :cl-steamworks)
                                       :name "low-level"
                                       :pathname file))
-            (compile (asdf:find-operation NIL 'asdf:compile-op))
-            (load (asdf:find-operation NIL 'asdf:load-op)))
-        (when (asdf:needed-in-image-p compile component)
-          (asdf:perform compile component))
-        (when (asdf:needed-in-image-p load component)
-          (asdf:perform load component)))
+            (compile (asdf:find-operation NIL 'asdf:compile-op)))
+        (asdf:perform compile component))
       #-asdf
       (let ((fasl (compile-file-pathname file)))
-        (unless (probe-file fasl)
-          (compile-file file :verbose NIL :print NIL :output-file fasl))
-        (load fasl :verbose NIL :print NIL))
+        (compile-file file :verbose NIL :print NIL :output-file fasl))
       T)))
 
 ;; DEFCSTRUCT interns its accessors in *PACKAGE* rather than using the package

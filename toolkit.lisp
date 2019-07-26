@@ -6,9 +6,48 @@
 
 (in-package #:org.shirakumo.fraf.steamworks)
 
-(or (maybe-load-low-level)
-    (alexandria:simple-style-warning "No low-level file present. Please install the SteamWorks SDK:
-Load cl-steamworks-generator and then run (cl-steamworks-generator:setup)"))
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (unless (maybe-load-low-level)
+    (alexandria:simple-style-warning "No low-level file present.
+Please follow the instructions in the documentation to set up this library properly.")
+    ;; KLUDGE: stub out types that are required to compile the library without the low-level file
+    (macrolet ((define-stub-types (&body body)
+                 `(progn ,@(loop for name in body collect
+                                 (if (listp name)
+                                     `(cffi:defcstruct ,(second name) ,@(cddr name))
+                                     `(cffi:defctype ,name :int))))))
+      (define-stub-types
+        steam::hserver-list-request
+        steam::hsteam-pipe
+        steam::depot-id-t
+        steam::app-id-t
+        steam::published-file-id-t
+        steam::controller-handle-t
+        steam::controller-action-set-handle-t
+        steam::steam-apicall-t
+        steam::steam-inventory-result-t
+        steam::steam-item-def-t
+        steam::steam-item-instance-id-t
+        steam::ematch-making-server-response
+        steam::echat-entry-type
+        steam::eitem-preview-type
+        steam::econtroller-action-origin
+        (:struct steam::gameserveritem)
+        (:struct steam::match-making-key-value-pair)
+        (:struct steam::p2psession-state)
+        (:struct steam::leaderboard-entry)
+        (:struct steam::steam-party-beacon-location
+                 (steam::type :int)
+                 (steam::location-id :int))
+        (:struct steam::steam-item-details)
+        (:struct steam::friend-game-info)
+        (:struct steam::steam-param-string-array
+                 (steam::strings :pointer)
+                 (steam::num-strings :int))
+        (:struct steam::steam-ugcdetails)
+        (:struct steam::input-digital-action-data)
+        (:struct steam::input-analog-action-data)
+        (:struct steam::input-motion-data)))))
 
 (defmacro with-cleanup-on-failure (cleanup &body body)
   (let ((err (gensym "ERROR")))
@@ -18,12 +57,6 @@ Load cl-steamworks-generator and then run (cl-steamworks-generator:setup)"))
               (setf ,err NIL))
          (when ,err
            ,cleanup)))))
-
-(defmacro with-error-on-failure (form)
-  (let ((result (gensym "RESULT")))
-    `(let ((,result ,form))
-       (unless (eql :ok ,result)
-         (error "FIXME: failed ~a" ,result)))))
 
 (defun calloc (type &optional (count 1))
   (let ((ptr (cffi:foreign-alloc type :count count)))
@@ -53,6 +86,20 @@ Load cl-steamworks-generator and then run (cl-steamworks-generator:setup)"))
   #+lispworks (lispworks:environment-variable x)
   #+mkcl (#.(or (find-symbol* 'getenv :si nil) (find-symbol* 'getenv :mk-ext nil)) x)
   #+sbcl (sb-ext:posix-getenv x))
+
+(defun cwd ()
+  #+(or abcl genera mezzano) (truename *default-pathname-defaults*)
+  #+allegro (excl::current-directory)
+  #+clisp (ext:default-directory)
+  #+clozure (ccl:current-directory)
+  #+(or cmucl scl) (#+cmucl parse-unix-namestring* #+scl lisp::parse-unix-namestring
+                    (strcat (nth-value 1 (unix:unix-current-directory)) "/"))
+  #+(or clasp ecl) (ext:getcwd)
+  #+gcl (let ((*default-pathname-defaults* #p"")) (truename #p""))
+  #+lispworks (hcl:get-working-directory)
+  #+mkcl (mk-ext:getcwd)
+  #+sbcl (sb-ext:parse-native-namestring (sb-unix:posix-getcwd/))
+  #+xcl (extensions:current-directory))
 
 (defun chdir (x)
   #+(or abcl xcl) (setf *default-pathname-defaults* (truename x))
@@ -85,13 +132,14 @@ Load cl-steamworks-generator and then run (cl-steamworks-generator:setup)"))
   #-windows #p"/tmp/")
 
 (defun setup-app-id (app-id)
-  (let ((directory (merge-pathnames "cl-steamworks/" (temp-directory))))
-    (chdir (ensure-directories-exist directory))
-    (with-open-file (stream (merge-pathnames #p"steam_appid.txt" directory)
-                            :direction :output
-                            :if-exists :supersede
-                            :element-type 'character)
-      (format stream "~a~%" app-id))))
+  (unless (probe-file (merge-pathnames #p"steam_appid.txt" (cwd)))
+    (let ((directory (merge-pathnames "cl-steamworks/" (temp-directory))))
+      (chdir (ensure-directories-exist directory))
+      (with-open-file (stream (merge-pathnames #p"steam_appid.txt" directory)
+                              :direction :output
+                              :if-exists :supersede
+                              :element-type 'character)
+        (format stream "~a~%" app-id)))))
 
 (defun enlist (a &rest items)
   (if (listp a) a (list* a items)))
@@ -117,6 +165,13 @@ Load cl-steamworks-generator and then run (cl-steamworks-generator:setup)"))
     (setf (ldb (byte 8  8) x) (parse-integer ipstring :start (1+ d2) :end d3))
     (setf (ldb (byte 8  0) x) (parse-integer ipstring :start (1+ d3)))
     x))
+
+(defun int->ipv4 (ipint)
+  (format NIL "~d.~d.~d.~d"
+          (ldb (byte 8 24) ipint)
+          (ldb (byte 8 16) ipint)
+          (ldb (byte 8  8) ipint)
+          (ldb (byte 8  0) ipint)))
 
 (defun remove-all (sequence &rest items)
   (remove-if (lambda (i) (find i items)) sequence))
@@ -167,3 +222,118 @@ Load cl-steamworks-generator and then run (cl-steamworks-generator:setup)"))
   ;; According to https://en.cppreference.com/w/c/string/byte/isprint
   ;; which is in the steam api for some reason.
   (find char "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"))
+
+(declaim (inline microsecs))
+(defun microsecs (s)
+  (floor (* s 1000000)))
+
+(declaim (inline millisecs))
+(defun millisecs (s)
+  (floor (* s 1000)))
+
+(defun url-encode (thing &key stream (external-format :utf-8) (allowed "-._~"))
+  (if stream
+      (loop for octet across (babel:string-to-octets thing :encoding external-format)
+            for char = (code-char octet)
+            do (cond ((or (char<= #\0 char #\9)
+                          (char<= #\a char #\z)
+                          (char<= #\A char #\Z)
+                          (find char allowed :test #'char=))
+                      (write-char char stream))
+                     (T (format stream "%~2,'0x" (char-code char)))))
+      (with-output-to-string (stream)
+        (url-encode thing :stream stream :external-format external-format :allowed allowed))))
+
+(defun url-decode (string &key (external-format :utf-8) start end)
+  (let ((out (make-array (length string) :element-type '(unsigned-byte 8) :fill-pointer 0)))
+    (loop for i from (or start 0) below (or end (length string))
+          for char = (aref string i)
+          do (case char
+               (#\% (vector-push (parse-integer string :start (+ i 1) :end (+ i 3) :radix 16) out)
+                (incf i 2))
+               (#\+ (vector-push (char-code #\Space) out))
+               (T (vector-push (char-code char) out)))
+          finally (return (babel:octets-to-string out :encoding external-format)))))
+
+(defun format-query (stream arg &rest args)
+  (declare (ignore args))
+  (loop for cons on arg
+        for (key . val) = (car cons)
+        do (url-encode key :stream stream)
+           (when (string/= "" val)
+             (write-char #\= stream)
+             (url-encode val :stream stream))
+           (when (cdr cons)
+             (write-char #\& stream))))
+
+(defun destructure-query (query)
+  (loop for part in (split-string query #\&)
+        for sep = (position #\= part)
+        collect (cons (url-decode part :end sep)
+                      (url-decode part :start (1+ sep)))))
+
+(defun merge-query (url get)
+  (let* ((fragment-p (position #\# url))
+         (query-p (position #\? url))
+         (fragment (when fragment-p (subseq url fragment-p)))
+         (query (when query-p (subseq url query-p (or fragment-p (length url))))))
+    (with-output-to-string (stream)
+      (write-string url stream :end (min (or fragment-p (length url)) (or query-p (length url))))
+      (cond (query
+             (write-string query stream)
+             (when get
+               (format stream "&~/cl-steamworks::format-query/" get)))
+            (get
+             (format stream "?~/cl-steamworks::format-query/" get)))
+      (when fragment
+        (write-string fragment stream)))))
+
+(defmacro with-foreign-value ((var type) &body body)
+  `(cffi:with-foreign-objects ((,var ,type))
+     ,@body
+     (cffi:mem-ref ,var ,type)))
+
+(defmacro with-foreign-values (bindings &body body)
+  `(cffi:with-foreign-objects ,bindings
+     ,@body
+     (values ,@(loop for (var type) in bindings
+                     collect `(cffi:mem-ref ,var ,type)))))
+
+(defun check-invalid (invalid value &optional call)
+  (if (equal invalid value)
+      (error 'api-call-failed :api-call call)
+      value))
+
+(defun check-valid (valid value &optional call)
+  (if (equal valid value)
+      value
+      (error 'api-call-failed :api-call call)))
+
+(defun check-empty-string (string &optional call)
+  (check-invalid "" string call))
+
+(defun check-utf8-size (length string)
+  (when (<= length (babel:string-size-in-octets string :encoding :utf-8))
+    (error 'string-too-long :oversized-string string :octet-limit length)))
+
+(defun check-result (result &optional call)
+  (unless (eql :ok result)
+    (error 'api-call-failed :api-call call :error-code result)))
+
+(defmacro with-valid-check (valid (call &rest args))
+  `(check-valid ,valid (,call ,@args) ',call))
+
+(defmacro with-invalid-check (invalid (call &rest args))
+  `(check-invalid ,invalid (,call ,@args) ',call))
+
+(defun fill-foreign-ascii (pointer string &optional length)
+  (dotimes (i (max (or length 0) (length string)))
+    (setf (cffi:mem-aref pointer :uchar) (char-code (aref string i)))))
+
+(defun read-file-to-sharable-byte-vector (path)
+  (with-open-file (stream path :direction :input :element-type '(unsigned-byte 8))
+    (let ((buffer (cffi:make-shareable-byte-vector (file-length stream))))
+      (loop with offset = 0
+            while (< offset (length buffer))
+            do (incf offset (read-sequence buffer stream :start offset)))
+      buffer)))

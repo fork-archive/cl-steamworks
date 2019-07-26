@@ -12,7 +12,7 @@
 (defmethod initialize-instance :after ((interface steamutils) &key version steamworks)
   (setf (handle interface) (get-interface-handle steamworks 'steam::client-get-isteam-utils
                                                  (handle (pipe steamworks))
-                                                 (t-or version steam::steamutils-interface-version))))
+                                                 (t-or version STEAM::STEAMUTILS-INTERFACE-VERSION))))
 
 (define-interface-method steamutils app-id (steam::utils-get-app-id))
 (define-interface-method steamutils ipc-call-count (steam::utils-get-ipccall-count))
@@ -36,8 +36,7 @@
 (defmethod input-text ((utils steamutils))
   (let ((length (steam::utils-get-entered-gamepad-text-length (handle utils))))
     (cffi:with-foreign-object (data :char length)
-      (unless (steam::utils-get-entered-gamepad-text-input (handle utils) data length)
-        (error "FIXME: failed to retrieve entered text. Was there any text to receive and are you in the callback?"))
+      (with-invalid-check NIL (steam::utils-get-entered-gamepad-text-input (handle utils) data length))
       (cffi:foreign-string-to-lisp data :count length :encoding :utf-8))))
 
 (defmacro with-input-text ((text utils &rest args) &body body)
@@ -61,17 +60,16 @@
     (steam::utils-set-overlay-notification-inset (handle utils) x y)
     value))
 
-(defclass image (c-object)
-  ((steamutils :initarg :steamutils :reader steamutils)
-   (width :reader width)
+(defclass image (interface-object)
+  ((width :reader width)
    (height :reader height)
-   (rgba :reader rgba)))
+   (rgba :reader rgba))
+  (:default-initargs :interface 'steamutils))
 
-(defmethod initialize-instance :after ((image image) &key steamutils handle)
+(defmethod initialize-instance :after ((image image) &key handle)
   (cffi:with-foreign-objects ((width :uint32)
                               (height :uint32))
-    (unless (steam::utils-get-image-size (handle steamutils) handle width height)
-      (error "FIXME: not a valid image handle."))
+    (with-invalid-check NIL (steam::utils-get-image-size (iface* image) handle width height))
     (setf (slot-value image 'width) (cffi:mem-ref width :uint32))
     (setf (slot-value image 'height) (cffi:mem-ref height :uint32))))
 
@@ -86,6 +84,5 @@
       (let* ((size (* 4 (width image) (height image)))
              (rgba (make-array size :element-type '(unsigned-byte 8))))
         (cffi:with-pointer-to-vector-data (data rgba)
-          (unless (steam::utils-get-image-rgba (handle (steamutils image)) (handle image) data size)
-            (error "FIXME: failed to receive image data.")))
+          (with-invalid-check NIL (steam::utils-get-image-rgba (iface* image) (handle image) data size)))
         (setf (slot-value image 'rgba) rgba))))
